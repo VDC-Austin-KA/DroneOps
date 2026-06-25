@@ -1,9 +1,9 @@
 import {
-  ACESFilmicToneMapping, AmbientLight, AnimationMixer, Box3, BoxGeometry, BufferGeometry, CanvasTexture,
+  ACESFilmicToneMapping, AdditiveBlending, AmbientLight, AnimationMixer, Box3, BoxGeometry, BufferGeometry, CanvasTexture,
   CatmullRomCurve3, CapsuleGeometry, CircleGeometry, Color, ConeGeometry, CylinderGeometry,
   DirectionalLight, DoubleSide, FogExp2, Group, HemisphereLight, Line, LineBasicMaterial,
   LineDashedMaterial, LineLoop, MathUtils, Matrix4, Mesh, MeshBasicMaterial, MeshStandardMaterial,
-  Object3D, PerspectiveCamera, PMREMGenerator, Raycaster, Scene, SphereGeometry, Sprite,
+  Object3D, PerspectiveCamera, PMREMGenerator, Raycaster, RingGeometry, Scene, SphereGeometry, Sprite,
   SpriteMaterial, Texture, TorusGeometry, TubeGeometry, Vector2, Vector3, WebGLRenderer,
 } from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
@@ -17,6 +17,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { geodeticToWorld, worldToGeodetic, localEnuFrame, metersPerDegree, distMeters } from './regionUtils';
 import { KINDS, SCENARIOS, KindId } from './catalog';
 import { Scenario, Situation, Telemetry, SafetyFinding, Debrief, Tool, CamMode, newScenario } from './types';
+import { fmtFt } from './units';
 
 export interface ViewerCallbacks {
   onReady?: () => void;
@@ -71,10 +72,36 @@ export class DroneViewer {
   private shadowAlt = 60;
   private sprites: Sprite[] = [];
 
+  // Heading correction (rad) for imported models that fly sideways along the path.
+  private modelYaw = 0;
+  // Drone highlight (glow halo + beacon beam) so it pops against the photoreal world.
+  private highlight = false;
+  private highlightGroup: Group | null = null;
+  // Prop-wash / downwash indicator: faint expanding rings that show the craft is actively flying.
+  private downwash: Mesh[] = [];
+  private downwashGroup: Group | null = null;
+  // Global toggle for the floating info annotations next to equipment/hazards.
+  private showInfo = false;
+  // Active interaction with the Google mesh: keep clearance / crash into terrain & buildings.
+  private avoidTerrain = true;
+  private terrainMin = 8;            // min clearance (m) the drone keeps above the mesh
+  private terrainLift = 0;           // current smoothed avoidance climb (m)
+  private terrainProbeFrame = 0;
+  // Tile styling: desaturate / dim / fade the Google tiles to focus attention on overlays.
+  private tileDim = false;
+  private tileUniforms = { uSat: { value: 1 }, uBright: { value: 1 }, uAlpha: { value: 1 } };
+  private styledTileMats = new Set<MeshStandardMaterial>();
+  // Cinematic / chase camera state (smoothed follow + user-orbitable scenario cam).
+  private camPos = new Vector3();
+  private camLook = new Vector3();
+  private camInit = false;
+  private cine = { az: 0.7, el: 0.5, dist: 220, auto: true };
+
   private safetyFindings: SafetyFinding[] = [];
   private sim = { playing: false, elapsed: 0, rate: 1, dist: 0, total: 0, pts: [] as Vector3[], cum: [] as number[],
     geo: [] as { lat: number; lon: number; alt: number; gh: number }[], batt: 100,
-    _lat: null as number | null, _lon: 0, _alt: 0, _pos: null as Vector3 | null, _dir: new Vector3(), _up: new Vector3() };
+    _lat: null as number | null, _lon: 0, _alt: 0, _pos: null as Vector3 | null, _dir: new Vector3(), _up: new Vector3(),
+    _agl: null as number | null };
   private simViolations = new Set<string>();
   private crash = { active: false, vel: new Vector3(), spin: new Vector3(), pos: new Vector3(), t: 0, grounded: false, groundH: 0 };
   private crashEnabled = true;
@@ -145,6 +172,7 @@ export class DroneViewer {
       this.frame();
       this.rebuildAll();
     });
+    tiles.addEventListener('load-model', (e: any) => { if (e?.scene) this.styleTileScene(e.scene); });
     tiles.addEventListener('load-error', (e: any) => {
       const url: string = e?.url || '';
       if (url.includes('googleapis.com') || /root\.json|3dtiles/.test(url))
@@ -156,6 +184,52 @@ export class DroneViewer {
   }
 
   private toast(m: string) { this.cb.onToast?.(m); }
+
+  // ---------------------------------------------------------------- tile styling
+  /** Inject a tiny shader hook into each Google-tile material so we can desaturate,
+   *  dim and fade the photoreal world on demand — focusing attention on the overlays. */
+  private styleTileScene(scene: Object3D) {
+    scene.traverse((o: any) => {
+      const m = o.material as MeshStandardMaterial | undefined;
+      if (!o.isMesh || !m || this.styledTileMats.has(m)) return;
+      this.styledTileMats.add(m);
+      m.onBeforeCompile = (shader: any) => {
+        shader.uniforms.uSat = this.tileUniforms.uSat;
+        shader.uniforms.uBright = this.tileUniforms.uBright;
+        shader.uniforms.uAlpha = this.tileUniforms.uAlpha;
+        shader.fragmentShader = 'uniform float uSat;\nuniform float uBright;\nuniform float uAlpha;\n' + shader.fragmentShader
+          .replace('#include <dithering_fragment>',
+            'float _l = dot(gl_FragColor.rgb, vec3(0.299,0.587,0.114));\n' +
+            'gl_FragColor.rgb = mix(vec3(_l), gl_FragColor.rgb, uSat) * uBright;\n' +
+            'gl_FragColor.a *= uAlpha;\n#include <dithering_fragment>');
+      };
+      if (this.tileDim) { m.transparent = this.tileUniforms.uAlpha.value < 1; m.depthWrite = this.tileUniforms.uAlpha.value >= 1; }
+      m.needsUpdate = true;
+    });
+  }
+  /** Toggle the desaturated/dimmed look of the Google tiles. */
+  setTileDim(on: boolean) {
+    this.tileDim = on;
+    this.tileUniforms.uSat.value = on ? 0.4 : 1;
+    this.tileUniforms.uBright.value = on ? 0.72 : 1;
+    this.applyTileTransparency();
+    this.cb.onScenarioChange?.(this.scenario);
+  }
+  getTileDim() { return this.tileDim; }
+  /** Set tile opacity (0.35–1). Below 1 makes the world translucent so overlays read through. */
+  setTileOpacity(a: number) {
+    this.tileUniforms.uAlpha.value = Math.max(0.35, Math.min(1, a));
+    this.applyTileTransparency();
+  }
+  getTileOpacity() { return this.tileUniforms.uAlpha.value; }
+  private applyTileTransparency() {
+    const a = this.tileUniforms.uAlpha.value;
+    this.styledTileMats.forEach((m) => {
+      const wantT = a < 1 || (this.tileDim && this.tileUniforms.uBright.value < 1);
+      m.transparent = a < 1; m.depthWrite = a >= 1;
+      if (wantT) m.needsUpdate = true;
+    });
+  }
 
   // ---------------------------------------------------------------- geo helpers
   private sampleGround(lat: number, lon: number): number {
@@ -175,23 +249,59 @@ export class DroneViewer {
     const h = this.raycaster.intersectObject(this.tiles.group, true);
     return h.length ? worldToGeodetic(h[0].point, this.tiles.group) : null;
   }
+  /** Vertical clearance (m) from a world point straight down to the loaded mesh (terrain or buildings). */
+  private meshClearanceBelow(pos: Vector3, up: Vector3): number | null {
+    if (!this.tiles) return null;
+    this.raycaster.set(pos.clone().add(up.clone().multiplyScalar(0.5)), up.clone().negate());
+    this.raycaster.far = 600;
+    const h = this.raycaster.intersectObject(this.tiles.group, true);
+    this.raycaster.far = Infinity;
+    return h.length ? h[0].distance : null;
+  }
+  /** Distance (m) to the first mesh surface along a direction, or null if clear within `far`. */
+  private meshHitAlong(pos: Vector3, dir: Vector3, far: number): number | null {
+    if (!this.tiles) return null;
+    this.raycaster.set(pos, dir.clone().normalize());
+    this.raycaster.far = far;
+    const h = this.raycaster.intersectObject(this.tiles.group, true);
+    this.raycaster.far = Infinity;
+    return h.length ? h[0].distance : null;
+  }
 
   // ---------------------------------------------------------------- events
   private bindEvents() {
     const el = this.renderer.domElement;
     el.addEventListener('pointerdown', this.onDown);
     el.addEventListener('pointerup', this.onUp);
+    el.addEventListener('pointermove', this.onMove);
+    el.addEventListener('wheel', this.onWheel, { passive: false });
     el.addEventListener('dragover', (e) => e.preventDefault());
     el.addEventListener('drop', this.onDrop);
     window.addEventListener('resize', this.onResize);
   }
+  // Manual orbit for the cinematic / scenario camera (GlobeControls is disabled in that mode).
+  private dragLast: { x: number; y: number } | null = null;
+  private onMove = (e: PointerEvent) => {
+    if (this.camMode !== 'cine' || this.dragLast === null) return;
+    const dx = e.clientX - this.dragLast.x, dy = e.clientY - this.dragLast.y;
+    this.dragLast = { x: e.clientX, y: e.clientY };
+    this.cine.az -= dx * 0.005;
+    this.cine.el = Math.max(0.05, Math.min(1.45, this.cine.el - dy * 0.005));
+    this.cine.auto = false; // user took over framing
+  };
+  private onWheel = (e: WheelEvent) => {
+    if (this.camMode !== 'cine') return;
+    e.preventDefault();
+    this.cine.dist = Math.max(30, Math.min(1600, this.cine.dist * (1 + Math.sign(e.deltaY) * 0.08)));
+  };
   private onResize = () => {
     this.camera.aspect = this.container.clientWidth / this.container.clientHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
   };
-  private onDown = (e: PointerEvent) => { this.downPt = { x: e.clientX, y: e.clientY }; this.downT = performance.now(); };
+  private onDown = (e: PointerEvent) => { this.downPt = { x: e.clientX, y: e.clientY }; this.downT = performance.now(); if (this.camMode === 'cine') this.dragLast = { x: e.clientX, y: e.clientY }; };
   private onUp = (e: PointerEvent) => {
+    this.dragLast = null;
     if (this.camMode !== 'orbit') return;
     if (Math.hypot(e.clientX - this.downPt.x, e.clientY - this.downPt.y) > 6 || performance.now() - this.downT > 500) return;
     const g = this.pickGround(e.clientX, e.clientY);
@@ -216,7 +326,10 @@ export class DroneViewer {
 
   private addSituation(kind: KindId, lat: number, lon: number) {
     const k = KINDS[kind];
-    this.scenario.situations.push({ id: uid(), kind, lat, lon, heading: 0, clearR: k.clearR, clearH: k.clearH, showClear: true, label: k.name });
+    this.scenario.situations.push({
+      id: uid(), kind, lat, lon, heading: 0, clearR: k.clearR, clearH: k.clearH, showClear: true, label: k.name,
+      scale: 1, height: k.h, reach: k.reach, showInfo: false,
+    });
     this.rebuildAll();
   }
 
@@ -248,8 +361,21 @@ export class DroneViewer {
     return grp;
   }
 
-  private buildSituationMesh(kind: KindId): Group {
-    const k = KINDS[kind], g = new Group();
+  /** Slewing swing-radius indicator for cranes: a swept disc + bright ring at jib height. */
+  private swingRadius(r: number, z: number, color: number): Group {
+    const grp = new Group();
+    const disc = this.disc(r, color, 0.08); disc.position.z = z; grp.add(disc);
+    const ring = this.ring(r, color); ring.position.z = z; (ring.material as LineBasicMaterial).transparent = true; (ring.material as LineBasicMaterial).opacity = 0.85; grp.add(ring);
+    // a faint cylinder linking the swing ring down to the ground so the volume reads in 3D
+    const geo = new CylinderGeometry(r, r, z, 40, 1, true); geo.rotateX(Math.PI / 2); geo.translate(0, 0, z / 2);
+    grp.add(new Mesh(geo, new MeshBasicMaterial({ color, transparent: true, opacity: 0.05, side: DoubleSide, depthWrite: false })));
+    return grp;
+  }
+
+  private buildSituationMesh(s: Situation): Group {
+    const kind = s.kind, k = KINDS[kind], g = new Group();
+    const H = s.height ?? k.h ?? 6;        // tunable physical height
+    const R = s.reach ?? k.reach ?? 0;     // crane jib / swing radius
     const mat = (c: number, e = 0) => new MeshStandardMaterial({ color: c, emissive: e, roughness: 0.7, metalness: 0.15 });
     const cyl = (rt: number, rb: number, h: number, c: number) => { const m = new Mesh(new CylinderGeometry(rt, rb, h, 12), mat(c)); m.rotation.x = Math.PI / 2; return m; };
     if (kind === 'helipad') {
@@ -257,27 +383,31 @@ export class DroneViewer {
       const t = new Mesh(new TorusGeometry(8, 0.4, 8, 40), mat(0xffd24d, 0x553300)); t.position.z = 0.5; g.add(t);
       ([[-3, 0, 1.4, 8], [3, 0, 1.4, 8], [0, 0, 5, 1.4]] as number[][]).forEach(([x, y, w, h]) => { const b = new Mesh(new BoxGeometry(w, h, 0.3), mat(0xffffff)); b.position.set(x, y, 0.6); g.add(b); });
     } else if (kind === 'towercrane') {
-      const H = k.h!; const mast = new Mesh(new BoxGeometry(2.4, 2.4, H), mat(0xffb020)); mast.position.z = H / 2; g.add(mast);
-      const jib = new Mesh(new BoxGeometry(70, 1.5, 1.5), mat(0xffcf5c)); jib.position.set(22, 0, H - 2); g.add(jib);
-      const cjib = new Mesh(new BoxGeometry(20, 1.4, 1.4), mat(0xffcf5c)); cjib.position.set(-10, 0, H - 2); g.add(cjib);
+      const mast = new Mesh(new BoxGeometry(2.4, 2.4, H), mat(0xffb020)); mast.position.z = H / 2; g.add(mast);
+      const jibLen = Math.max(20, R || 35);           // working jib reaches out to the swing radius
+      const jib = new Mesh(new BoxGeometry(jibLen, 1.5, 1.5), mat(0xffcf5c)); jib.position.set(jibLen / 2 - 3, 0, H - 2); g.add(jib);
+      const cjib = new Mesh(new BoxGeometry(jibLen * 0.32, 1.4, 1.4), mat(0xffcf5c)); cjib.position.set(-jibLen * 0.16, 0, H - 2); g.add(cjib);
       const cab = new Mesh(new BoxGeometry(3, 3, 3), mat(0x333333)); cab.position.set(2, 0, H - 4); g.add(cab);
-      const hook = new Mesh(new BoxGeometry(0.4, 0.4, 5), mat(0x222222)); hook.position.set(40, 0, H - 10); g.add(hook);
+      const hook = new Mesh(new BoxGeometry(0.4, 0.4, 5), mat(0x222222)); hook.position.set(jibLen * 0.7, 0, H - 10); g.add(hook);
+      if (R > 0) g.add(this.swingRadius(R, H - 2, 0xffb020)); // always-visible slew envelope
     } else if (kind === 'mobilecrane') {
       const base = new Mesh(new BoxGeometry(8, 3.5, 2.4), mat(0xffb020)); base.position.z = 1.2; g.add(base);
-      const boom = new Mesh(new BoxGeometry(2, 1.4, k.h!), mat(0xffcf5c)); boom.position.set(0, 0, k.h! / 2 + 2); boom.rotation.y = 0.5; g.add(boom);
+      const boom = new Mesh(new BoxGeometry(2, 1.4, H), mat(0xffcf5c)); boom.position.set(0, 0, H / 2 + 2); boom.rotation.y = 0.5; g.add(boom);
+      if (R > 0) g.add(this.swingRadius(R, H * 0.8, 0xffb020));
     } else if (kind === 'excavator') {
       const tr = new Mesh(new BoxGeometry(6, 2.6, 1.4), mat(0x333333)); tr.position.z = 0.7; g.add(tr);
       const cab = new Mesh(new BoxGeometry(3.4, 2.4, 2.4), mat(0xffb020)); cab.position.set(-0.5, 0, 2.6); g.add(cab);
       const arm = new Mesh(new BoxGeometry(5, 0.8, 0.8), mat(0xffcf5c)); arm.position.set(2.5, 0, 3.2); arm.rotation.y = -0.6; g.add(arm);
+      if (R > 0) g.add(this.swingRadius(R, 3, 0xffb020));
     } else if (kind === 'comm') {
-      const t = cyl(0.6, 2.5, k.h!, 0xb9c2cc); t.position.z = k.h! / 2; g.add(t);
-      const b = new Mesh(new SphereGeometry(1.4, 12, 12), mat(0xff3030, 0x880000)); b.position.z = k.h!; g.add(b);
+      const t = cyl(0.6, 2.5, H, 0xb9c2cc); t.position.z = H / 2; g.add(t);
+      const b = new Mesh(new SphereGeometry(1.4, 12, 12), mat(0xff3030, 0x880000)); b.position.z = H; g.add(b);
     } else if (kind === 'building') {
-      const b = new Mesh(new BoxGeometry(18, 18, k.h!), mat(0x8893a0)); b.position.z = k.h! / 2; g.add(b);
+      const b = new Mesh(new BoxGeometry(18, 18, H), mat(0x8893a0)); b.position.z = H / 2; g.add(b);
     } else if (kind === 'powerline') {
-      [-14, 14].forEach((x) => { const p = cyl(0.4, 0.5, k.h!, 0x8a939e); p.position.set(x, 0, k.h! / 2); g.add(p);
-        const arm = new Mesh(new BoxGeometry(0.3, 5, 0.3), mat(0x555555)); arm.position.set(x, 0, k.h! - 2); g.add(arm); });
-      [-2, 2].forEach((y) => { const w = new Mesh(new BoxGeometry(28, 0.12, 0.12), mat(0x222222)); w.position.set(0, y, k.h! - 2); g.add(w); });
+      [-14, 14].forEach((x) => { const p = cyl(0.4, 0.5, H, 0x8a939e); p.position.set(x, 0, H / 2); g.add(p);
+        const arm = new Mesh(new BoxGeometry(0.3, 5, 0.3), mat(0x555555)); arm.position.set(x, 0, H - 2); g.add(arm); });
+      [-2, 2].forEach((y) => { const w = new Mesh(new BoxGeometry(28, 0.12, 0.12), mat(0x222222)); w.position.set(0, y, H - 2); g.add(w); });
     } else if (kind === 'tree') {
       const tr = cyl(0.6, 0.9, 8, 0x6b4a2b); tr.position.z = 4; g.add(tr);
       const cr = new Mesh(new SphereGeometry(5, 12, 12), mat(0x3f7d3f)); cr.scale.z = 1.2; cr.position.z = 11; g.add(cr);
@@ -314,6 +444,52 @@ export class DroneViewer {
     const tex = new CanvasTexture(c);
     const m = new Mesh(new CircleGeometry(3, 32), new MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
     return m;
+  }
+
+  /** A glowing halo + skyward beacon beam that makes the drone pop against the photoreal world. */
+  private buildHighlight(scale: number): Group {
+    const g = new Group();
+    // additive radial halo sprite (always faces camera, drawn on top)
+    const c = document.createElement('canvas'); c.width = c.height = 128; const ctx = c.getContext('2d')!;
+    const rg = ctx.createRadialGradient(64, 64, 2, 64, 64, 64);
+    rg.addColorStop(0, 'rgba(120,225,255,0.95)'); rg.addColorStop(0.4, 'rgba(57,182,255,0.45)'); rg.addColorStop(1, 'rgba(57,182,255,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, 128, 128);
+    const halo = new Sprite(new SpriteMaterial({ map: new CanvasTexture(c), transparent: true, depthTest: false, blending: AdditiveBlending }));
+    const hs = Math.max(10, scale * 2.2); halo.scale.set(hs, hs, 1); halo.position.z = 0.4 * scale;
+    (g as any).userData.halo = halo; g.add(halo);
+    // thin vertical beacon beam rising from the craft
+    const beam = new Mesh(new CylinderGeometry(0.12 * scale, 0.5 * scale, 26 * Math.max(1, scale / 4), 12, 1, true),
+      new MeshBasicMaterial({ color: 0x39b6ff, transparent: true, opacity: 0.16, blending: AdditiveBlending, depthWrite: false, side: DoubleSide }));
+    beam.rotation.x = Math.PI / 2; beam.position.z = 13 * Math.max(1, scale / 4); g.add(beam);
+    return g;
+  }
+
+  /** Faint prop-wash rings that ripple down toward the ground — the "it is flying" cue. */
+  private buildDownwash(): Group {
+    const g = new Group(); this.downwash = [];
+    for (let i = 0; i < 4; i++) {
+      const m = new Mesh(new RingGeometry(0.6, 1.0, 32),
+        new MeshBasicMaterial({ color: 0xdfeefb, transparent: true, opacity: 0, side: DoubleSide, depthWrite: false }));
+      (m as any).userData.phase = i / 4; g.add(m); this.downwash.push(m);
+    }
+    return g;
+  }
+
+  /** Multi-line floating annotation (height / clearance / reach) for equipment & hazards. */
+  private infoSprite(lines: string[]): Sprite {
+    const fs = 32, pad = 12, lh = fs + 8, c = document.createElement('canvas'), ctx = c.getContext('2d')!;
+    ctx.font = `500 ${fs}px system-ui,sans-serif`;
+    const w = Math.max(...lines.map((t) => ctx.measureText(t).width));
+    c.width = w + pad * 2; c.height = lines.length * lh + pad * 2;
+    ctx.font = `500 ${fs}px system-ui,sans-serif`;
+    ctx.fillStyle = 'rgba(10,16,22,.84)'; this.rr(ctx, 0, 0, c.width, c.height, 12); ctx.fill();
+    ctx.fillStyle = '#cfe2f2'; ctx.textBaseline = 'middle';
+    lines.forEach((t, i) => ctx.fillText(t, pad, pad + lh * i + lh / 2));
+    const tex = new CanvasTexture(c); tex.anisotropy = 4;
+    const sp = new Sprite(new SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+    (sp as any).userData.aspect = c.width / c.height; sp.scale.set(c.width / c.height, 1, 1);
+    this.sprites.push(sp);
+    return sp;
   }
 
   /** Built-in animated DJI Mavic 3 Pro–style model (local ENU, +X forward, Z up). */
@@ -444,11 +620,26 @@ export class DroneViewer {
     if (!this.tiles) return;
     this.scenario.situations.forEach((s) => {
       const k = KINDS[s.kind]; const gh = this.sampleGround(s.lat, s.lon); const a = this.makeAnchor(s.lat, s.lon, gh);
-      const inner = new Group(); inner.rotation.z = (s.heading || 0) * MathUtils.DEG2RAD; inner.add(this.buildSituationMesh(s.kind)); a.add(inner);
+      const scale = s.scale ?? 1;
+      const inner = new Group(); inner.rotation.z = (s.heading || 0) * MathUtils.DEG2RAD; inner.scale.setScalar(scale);
+      inner.add(this.buildSituationMesh(s)); a.add(inner);
       if (this.showClearance && s.showClear) a.add(this.clearanceVolume(s.clearR, s.clearH, k.color, k.mode));
-      const sp = this.labelSprite(`${k.ic} ${s.label || k.name}`); sp.position.set(0, 0, (k.h || 6) + 8); a.add(sp);
+      const topZ = ((s.height ?? k.h ?? 6) * scale) + 8;
+      const sp = this.labelSprite(`${k.ic} ${s.label || k.name}`); sp.position.set(0, 0, topZ); a.add(sp);
+      if (this.showInfo || s.showInfo) {
+        const info = this.infoSprite(this.situationInfoLines(s)); info.position.set(0, 0, topZ + 12); a.add(info);
+      }
       this.sitGroup.add(a);
     });
+  }
+  /** Build the small annotation text for an equipment / hazard, in US units. */
+  private situationInfoLines(s: Situation): string[] {
+    const k = KINDS[s.kind]; const lines = [`${k.ic} ${s.label || k.name}`];
+    const h = s.height ?? k.h; if (h && k.mode === 'obstacle') lines.push(`Height ${fmtFt(h)}`);
+    const r = s.reach ?? k.reach; if (r) lines.push(`Reach / swing ${fmtFt(r)}`);
+    if (k.mode === 'ceiling') lines.push(`Ceiling ${fmtFt(s.clearH)}`);
+    else lines.push(`Standoff ${fmtFt(s.clearR)} · to ${fmtFt(s.clearH)}`);
+    return lines;
   }
   private rebuildPois() {
     this.clearGroup(this.poiGroup);
@@ -467,18 +658,21 @@ export class DroneViewer {
     this.scenario.areas.forEach((ar) => {
       const gh = this.sampleGround(ar.lat, ar.lon); const a = this.makeAnchor(ar.lat, ar.lon, gh + 1);
       a.add(this.disc(ar.radius, 0x2bd67b, 0.1)); a.add(this.ring(ar.radius, 0x2bd67b));
-      const sp = this.labelSprite('⭕ ' + (ar.label || 'Area') + ` · ${Math.round(ar.radius)}m`, '#bff3d6'); sp.position.set(0, 0, 8); a.add(sp);
+      const sp = this.labelSprite('⭕ ' + (ar.label || 'Area') + ` · ${fmtFt(ar.radius)} r`, '#bff3d6'); sp.position.set(0, 0, 8); a.add(sp);
       this.areaGroup.add(a);
     });
   }
   private rebuildDrone() {
     this.clearGroup(this.droneGroup); this.droneMesh = null; this.droneAnchor = null; this.droneLift = null;
-    this.shadowBlob = null; this.mixer = null;
+    this.shadowBlob = null; this.mixer = null; this.highlightGroup = null; this.downwashGroup = null; this.downwash = [];
     if (!this.tiles) return;
     const d = this.scenario.drone;
+    this.modelYaw = (d.modelYaw || 0) * MathUtils.DEG2RAD;
+    this.highlight = !!d.highlight;
     if (d.lat == null || d.lon == null) return;
     const gh = this.sampleGround(d.lat, d.lon);
     this.shadowAlt = this.scenario.defaultAlt;
+    this.terrainLift = 0;
     this.droneAnchor = this.makeAnchor(d.lat, d.lon, gh + this.scenario.defaultAlt);
     // ground contact shadow lives in the anchor, dropped to the ground each frame
     this.shadowBlob = this.buildShadowBlob(); this.shadowBlob.position.z = -this.scenario.defaultAlt; this.droneAnchor.add(this.shadowBlob);
@@ -490,6 +684,10 @@ export class DroneViewer {
     } else {
       this.droneMesh = this.buildDrone(); this.droneMesh.scale.setScalar(d.scale); this.droneAnchor.add(this.droneMesh);
     }
+    // visibility highlight (glow halo + beacon) — toggleable
+    this.highlightGroup = this.buildHighlight(d.scale); this.highlightGroup.visible = this.highlight; this.droneAnchor.add(this.highlightGroup);
+    // prop-wash downwash rings — only visible while actively flying
+    this.downwashGroup = this.buildDownwash(); this.droneAnchor.add(this.downwashGroup);
     this.droneGroup.add(this.droneAnchor);
   }
 
@@ -527,7 +725,7 @@ export class DroneViewer {
   private runSafety() {
     const f: SafetyFinding[] = [], p = this.scenario.path;
     const maxAlt = Math.max(0, ...p.map((w) => w.alt));
-    if (maxAlt > 120) f.push({ lvl: 'warn', msg: `Peak altitude ${Math.round(maxAlt)} m AGL exceeds the 120 m (400 ft) Part 107 ceiling.` });
+    if (maxAlt > 120) f.push({ lvl: 'warn', msg: `Peak altitude ${fmtFt(maxAlt)} AGL exceeds the 400 ft (120 m) Part 107 ceiling.` });
     if (p.length >= 2) {
       const dense: { lat: number; lon: number; alt: number }[] = [];
       for (let i = 0; i < p.length - 1; i++) { const A = p[i], B = p[i + 1]; for (let t = 0; t < 1; t += 0.08) dense.push({ lat: A.lat + (B.lat - A.lat) * t, lon: A.lon + (B.lon - A.lon) * t, alt: A.alt + (B.alt - A.alt) * t }); }
@@ -536,11 +734,11 @@ export class DroneViewer {
         const k = KINDS[s.kind]; let minH = Infinity, breach = false, ceilBust = false;
         dense.forEach((d) => { const dist = distMeters(d.lat, d.lon, s.lat, s.lon); minH = Math.min(minH, dist);
           if (dist < s.clearR) { if (k.mode === 'ceiling') { if (d.alt > s.clearH) ceilBust = true; } else if (d.alt < s.clearH) breach = true; } });
-        if (k.mode === 'ceiling' && ceilBust) f.push({ lvl: 'bad', msg: `Path exceeds the ${s.clearH} m ceiling inside ${s.label || k.name} — requires LAANC authorization.` });
+        if (k.mode === 'ceiling' && ceilBust) f.push({ lvl: 'bad', msg: `Path exceeds the ${fmtFt(s.clearH)} ceiling inside ${s.label || k.name} — requires LAANC authorization.` });
         else if (breach && k.mode === 'restricted') f.push({ lvl: 'bad', msg: `Path enters ${s.label || k.name} restricted airspace/zone.` });
-        else if (breach && k.mode === 'obstacle') f.push({ lvl: 'bad', msg: `Path violates clearance around ${s.label || k.name} (within ${s.clearR} m & below ${s.clearH} m).` });
+        else if (breach && k.mode === 'obstacle') f.push({ lvl: 'bad', msg: `Path violates clearance around ${s.label || k.name} (within ${fmtFt(s.clearR)} & below ${fmtFt(s.clearH)}).` });
         else if (breach && k.mode === 'hazard') f.push({ lvl: 'warn', msg: `Path crosses ${s.label || k.name} hazard area — heightened vigilance advised.` });
-        else if (k.mode === 'obstacle' && minH < s.clearR * 1.6) f.push({ lvl: 'warn', msg: `Path passes close to ${s.label || k.name} (${Math.round(minH)} m horizontal).` });
+        else if (k.mode === 'obstacle' && minH < s.clearR * 1.6) f.push({ lvl: 'warn', msg: `Path passes close to ${s.label || k.name} (${fmtFt(minH)} horizontal).` });
       });
     } else if (p.length === 1) f.push({ lvl: 'warn', msg: 'Add at least 2 waypoints to define a flight path.' });
     if (p.length > 0 && !this.scenario.situations.some((s) => s.kind === 'helipad')) f.push({ lvl: 'warn', msg: 'No helipad / landing zone set — define a takeoff & RTH point.' });
@@ -563,6 +761,7 @@ export class DroneViewer {
   reset() {
     this.sim.playing = false; this.sim.elapsed = 0; this.sim.dist = 0; this.sim.batt = 100; this.simViolations.clear();
     this.crash.active = false; this.cb.onDebrief?.(null);
+    this.terrainLift = 0; this.sim._agl = null;
     this.buildSimPath();
     if (this.droneMesh) this.droneMesh.rotation.set(0, 0, 0);
     this.placeDroneAtDistance(0);
@@ -584,27 +783,78 @@ export class DroneViewer {
     const a = this.sim.pts[i - 1], b = this.sim.pts[i] || a;
     const segLen = (this.sim.cum[i] ?? this.sim.total) - this.sim.cum[i - 1] || 1;
     const t = Math.min(1, (dist - this.sim.cum[i - 1]) / segLen);
-    const pos = a.clone().lerp(b, t);
     const ga = this.sim.geo[i - 1], gb = this.sim.geo[i] || ga;
     const curLat = ga.lat + (gb.lat - ga.lat) * t, curLon = ga.lon + (gb.lon - ga.lon) * t, curAlt = ga.alt + (gb.alt - ga.alt) * t;
-    localEnuFrame(curLat, curLon, this.sim.geo[0].gh + curAlt, this.tiles.group, this.droneAnchor.matrix); this.droneAnchor.matrixWorldNeedsUpdate = true;
+    const gh0 = this.sim.geo[0].gh;
+
+    // --- active interaction with the Google mesh (terrain + buildings) ---
+    // Probe straight down (throttled) for the clearance to the real photoreal geometry.
+    let plannedPos = geodeticToWorld(curLat, curLon, gh0 + curAlt, this.tiles.group);
+    const up0 = geodeticToWorld(curLat, curLon, gh0 + curAlt + 10, this.tiles.group).sub(plannedPos).normalize();
+    let meshAgl: number | null = this.sim._agl;
+    if ((this.terrainProbeFrame++ & 1) === 0) meshAgl = this.meshClearanceBelow(plannedPos, up0);
+    // Avoidance: if too close to the mesh, climb to keep the minimum clearance (smoothed).
+    let targetLift = 0;
+    if (this.avoidTerrain && meshAgl != null && meshAgl < this.terrainMin)
+      targetLift = Math.min(80, this.terrainMin - meshAgl);
+    this.terrainLift += (targetLift - this.terrainLift) * 0.25;
+    if (this.terrainLift < 0.05) this.terrainLift = 0;
+
+    const finalAlt = curAlt + this.terrainLift;
+    localEnuFrame(curLat, curLon, gh0 + finalAlt, this.tiles.group, this.droneAnchor.matrix); this.droneAnchor.matrixWorldNeedsUpdate = true;
+    const pos = geodeticToWorld(curLat, curLon, gh0 + finalAlt, this.tiles.group);
+
     const { mLat, mLon } = metersPerDegree(curLat); const vE = (gb.lon - ga.lon) * mLon, vN = (gb.lat - ga.lat) * mLat;
-    if (this.droneMesh && (vE || vN)) this.droneMesh.rotation.z = Math.atan2(vN, vE);
-    this.sim._lat = curLat; this.sim._lon = curLon; this.sim._alt = curAlt; this.sim._pos = pos; this.shadowAlt = curAlt;
-    this.sim._up = geodeticToWorld(curLat, curLon, this.sim.geo[0].gh + curAlt + 10, this.tiles.group).sub(pos).normalize();
+    // Heading along the path, plus the yaw correction for imported models that point sideways.
+    if (this.droneMesh && (vE || vN)) this.droneMesh.rotation.z = Math.atan2(vN, vE) + this.modelYaw;
+    this.sim._lat = curLat; this.sim._lon = curLon; this.sim._alt = finalAlt; this.sim._pos = pos; this.shadowAlt = finalAlt;
+    this.sim._up = up0;
     this.sim._dir = b.clone().sub(a); if (this.sim._dir.lengthSq() < 1e-6) this.sim._dir = this.sim._up.clone(); this.sim._dir.normalize();
-    this.simViolations.clear(); let hit: Situation | null = null;
+    const effAgl = meshAgl == null ? null : meshAgl + this.terrainLift;
+    this.sim._agl = effAgl;
+
+    this.simViolations.clear(); let hit: Situation | null = null; let terrainHit = false;
+    // Forward look-ahead against the mesh so the operator sees an imminent strike.
+    if (this.sim.playing) {
+      const ahead = this.meshHitAlong(pos, this.sim._dir, Math.max(20, this.scenario.speed * 2.5));
+      if (ahead != null && ahead < Math.max(12, this.scenario.speed * 1.2)) this.simViolations.add('Structure / terrain directly ahead');
+    }
+    if (effAgl != null && effAgl < this.terrainMin) {
+      this.simViolations.add(`Terrain/structure proximity — ${fmtFt(Math.max(0, effAgl))} clearance`);
+      if (effAgl <= 1.5 && !this.avoidTerrain) terrainHit = true;
+    }
     this.scenario.situations.forEach((s) => {
       const k = KINDS[s.kind]; const d = distMeters(curLat, curLon, s.lat, s.lon);
       if (d < s.clearR) {
-        if (k.mode === 'obstacle' && curAlt < s.clearH) { this.simViolations.add('COLLISION RISK — ' + (s.label || k.name)); if (d < s.clearR * 0.55) hit = s; }
-        else if (k.mode === 'restricted' && curAlt < s.clearH) this.simViolations.add('In restricted zone — ' + (s.label || k.name));
-        else if (k.mode === 'ceiling' && curAlt > s.clearH) this.simViolations.add('Above LAANC ceiling — ' + (s.label || k.name));
+        if (k.mode === 'obstacle' && finalAlt < s.clearH) { this.simViolations.add('COLLISION RISK — ' + (s.label || k.name)); if (d < s.clearR * 0.55) hit = s; }
+        else if (k.mode === 'restricted' && finalAlt < s.clearH) this.simViolations.add('In restricted zone — ' + (s.label || k.name));
+        else if (k.mode === 'ceiling' && finalAlt > s.clearH) this.simViolations.add('Above LAANC ceiling — ' + (s.label || k.name));
         else if (k.mode === 'hazard') this.simViolations.add('In hazard area — ' + (s.label || k.name));
       }
     });
     this.setAlert(this.simViolations.size > 0);
     if (hit && this.crashEnabled && this.sim.playing && !this.crash.active) this.triggerCrash(hit);
+    else if (terrainHit && this.crashEnabled && this.sim.playing && !this.crash.active) this.triggerTerrainCrash();
+  }
+
+  private triggerTerrainCrash() {
+    this.crash.active = true; this.sim.playing = false; this.crash.t = 0; this.crash.grounded = false;
+    this.crash.pos = this.sim._pos!.clone();
+    this.crash.vel = this.sim._dir.clone().multiplyScalar(6).add(this.sim._up.clone().multiplyScalar(2));
+    this.crash.spin = new Vector3((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6, (Math.random() - 0.5) * 8);
+    this.crash.groundH = this.sampleGround(this.sim._lat!, this.sim._lon);
+    this.emitTelemetry('💥 CRASH');
+    this.cb.onDebrief?.({
+      title: '💥 CONTROLLED FLIGHT INTO TERRAIN',
+      cause: `The aircraft flew into mapped terrain / a building. Clearance to the surface dropped below the ${fmtFt(this.terrainMin)} safety minimum. Enable "Auto-avoid terrain" or raise waypoint altitudes so the path clears the real geometry.`,
+      steps: [
+        'Survey the 3D world along your route before flying — note ridgelines, rooftops and towers.',
+        'Set each waypoint altitude to clear the highest obstacle in that segment with margin.',
+        'Turn on Auto-avoid terrain to let the aircraft hold a minimum clearance above the mesh.',
+        'Maintain visual line of sight and a spotter in cluttered or vertical environments.',
+        'If a strike is imminent: climb, do not dive — most CFIT is avoidable with early altitude.',
+      ],
+    });
   }
 
   private triggerCrash(s: Situation) {
@@ -617,7 +867,7 @@ export class DroneViewer {
     const k = KINDS[s.kind];
     this.cb.onDebrief?.({
       title: '💥 COLLISION — ' + (s.label || k.name),
-      cause: `The flight path violated the clearance volume of ${s.label || k.name} (standoff ${s.clearR} m / ${s.clearH} m). At this speed the aircraft could not avoid the obstacle.`,
+      cause: `The flight path violated the clearance volume of ${s.label || k.name} (standoff ${fmtFt(s.clearR)} / ${fmtFt(s.clearH)}). At this speed the aircraft could not avoid the obstacle.`,
       steps: [
         'Stay calm — if airborne, immediately reduce throttle and arrest the descent if any control remains.',
         'Call out the emergency to your visual observer / crew and clear the area below the aircraft.',
@@ -637,18 +887,35 @@ export class DroneViewer {
   setCam(m: CamMode) {
     this.camMode = m;
     this.controls.enabled = m === 'orbit';
+    this.camInit = false; // re-seed the smoothed follow so it eases in cleanly
     this.cb.onCam?.(m);
     if (m === 'ground' && this.sim._lat != null) {
       const { mLat, mLon } = metersPerDegree(this.sim._lat);
       this.groundObs = { lat: this.sim._lat - 40 / mLat, lon: this.sim._lon - 40 / mLon };
     }
   }
-  private updateCamera() {
-    if (this.camMode === 'orbit' || this.sim._pos == null) return;
+  /** Smoothly approach a target eye/look pose — gives chase & cine cams a cinematic glide. */
+  private easeCamera(eye: Vector3, look: Vector3, up: Vector3, fov: number, k = 0.12) {
+    if (!this.camInit) { this.camPos.copy(eye); this.camLook.copy(look); this.camInit = true; }
+    this.camPos.lerp(eye, k); this.camLook.lerp(look, k);
+    this.camera.position.copy(this.camPos); this.camera.up.copy(up); this.camera.lookAt(this.camLook);
+    this.camera.fov += (fov - this.camera.fov) * k; this.camera.updateProjectionMatrix();
+  }
+  private updateCamera(dt: number) {
+    if (this.camMode === 'orbit') return;
+    if (this.camMode === 'cine') { this.updateCineCamera(dt); return; }
+    if (this.sim._pos == null) return;
     if (this.camMode === 'fpv') {
       const eye = this.sim._pos.clone().add(this.sim._up.clone().multiplyScalar(0.5 * this.scenario.drone.scale));
       const look = eye.clone().add(this.sim._dir.clone().multiplyScalar(120));
       this.camera.position.copy(eye); this.camera.up.copy(this.sim._up); this.camera.lookAt(look); this.camera.fov = 78; this.camera.updateProjectionMatrix();
+    } else if (this.camMode === 'chase') {
+      // 3rd-person follow: sit behind & above the drone, looking at it.
+      const back = this.sim._dir.clone().multiplyScalar(-12 - this.scenario.drone.scale * 1.5);
+      const lift = this.sim._up.clone().multiplyScalar(5 + this.scenario.drone.scale * 0.6);
+      const eye = this.sim._pos.clone().add(back).add(lift);
+      const look = this.sim._pos.clone().add(this.sim._dir.clone().multiplyScalar(6));
+      this.easeCamera(eye, look, this.sim._up, 55, 0.15);
     } else if (this.camMode === 'ground') {
       if (!this.groundObs) { const { mLat, mLon } = metersPerDegree(this.sim._lat!); this.groundObs = { lat: this.sim._lat! - 40 / mLat, lon: this.sim._lon - 40 / mLon }; }
       const gh = this.sampleGround(this.groundObs.lat, this.groundObs.lon);
@@ -656,6 +923,26 @@ export class DroneViewer {
       const up = geodeticToWorld(this.groundObs.lat, this.groundObs.lon, gh + 10, this.tiles.group).sub(eye).normalize();
       this.camera.position.copy(eye); this.camera.up.copy(up); this.camera.lookAt(this.sim._pos); this.camera.fov = 42; this.camera.updateProjectionMatrix();
     }
+  }
+  /** Scenario / cinematic camera: keeps the whole situation framed, focus locked on the
+   *  subject (drone if flying, otherwise the scene centroid), orbitable by drag, slow auto-orbit. */
+  private updateCineCamera(dt: number) {
+    const subjectGeo = this.sim._lat != null && (this.sim.playing || this.crash.active)
+      ? { lat: this.sim._lat, lon: this.sim._lon } : this.scenarioCentroid();
+    if (!subjectGeo) return;
+    const gh = this.sampleGround(subjectGeo.lat, subjectGeo.lon);
+    const focusAlt = this.sim._pos && (this.sim.playing || this.crash.active) ? this.sim._alt * 0.6 : 20;
+    const target = geodeticToWorld(subjectGeo.lat, subjectGeo.lon, gh + focusAlt, this.tiles.group);
+    const up = geodeticToWorld(subjectGeo.lat, subjectGeo.lon, gh + focusAlt + 100, this.tiles.group).sub(target).normalize();
+    const east = geodeticToWorld(subjectGeo.lat, subjectGeo.lon + 0.001, gh + focusAlt, this.tiles.group).sub(target).normalize();
+    const north = new Vector3().crossVectors(up, east).normalize();
+    if (this.cine.auto) this.cine.az += dt * 0.06; // gentle drift
+    const r = this.cine.dist, ce = Math.cos(this.cine.el), se = Math.sin(this.cine.el);
+    const offset = east.clone().multiplyScalar(Math.cos(this.cine.az) * ce * r)
+      .add(north.clone().multiplyScalar(Math.sin(this.cine.az) * ce * r))
+      .add(up.clone().multiplyScalar(se * r + 8));
+    const eye = target.clone().add(offset);
+    this.easeCamera(eye, target, up, 48, 0.1);
   }
 
   // ---------------------------------------------------------------- loop
@@ -688,6 +975,27 @@ export class DroneViewer {
       (this.shadowBlob.material as MeshBasicMaterial).opacity = Math.max(0.08, 0.5 - this.shadowAlt / 260);
     }
 
+    // drone highlight: gently pulse the halo so it reads as a live beacon
+    if (this.highlightGroup) {
+      this.highlightGroup.visible = this.highlight;
+      const halo = (this.highlightGroup as any).userData.halo as Sprite | undefined;
+      if (halo) (halo.material as SpriteMaterial).opacity = 0.65 + 0.35 * (0.5 + 0.5 * Math.sin(this.bob * 3));
+    }
+    // downwash / prop-wash rings: only while actively flying, rippling down to the ground
+    if (this.downwash.length) {
+      const sc = this.scenario.drone.scale;
+      this.downwash.forEach((m) => {
+        const ud = (m as any).userData; const mat = m.material as MeshBasicMaterial;
+        if (flying && !this.crash.active) {
+          ud.phase = (ud.phase + dt * 0.7) % 1;
+          const p = ud.phase;
+          m.position.z = -p * (6 + sc * 1.2);                 // descend toward the ground
+          m.scale.setScalar(sc * (0.5 + p * 2.4));            // spread outward
+          mat.opacity = 0.16 * (1 - p);                       // fade as it falls — barely visible
+        } else { mat.opacity = 0; }
+      });
+    }
+
     if (this.sim.playing) {
       this.sim.dist += this.scenario.speed * this.sim.rate * dt; this.sim.elapsed += dt; this.sim.batt = Math.max(0, 100 - this.sim.elapsed * this.sim.rate * 0.25);
       if (this.sim.dist >= this.sim.total) { this.sim.dist = this.sim.total; this.sim.playing = false; this.emitTelemetry('✓ ARRIVED'); this.toast('Mission complete'); }
@@ -713,7 +1021,7 @@ export class DroneViewer {
       if (mat.opacity <= 0) { m.geometry.dispose(); mat.dispose(); this.fxGroup.remove(m); }
     }
 
-    this.updateCamera();
+    this.updateCamera(dt);
 
     const tmp = new Vector3();
     this.sprites.forEach((sp) => { if (!sp.parent) return; sp.getWorldPosition(tmp); const d = tmp.distanceTo(this.camera.position); const sc = Math.max(6, d * 0.022); sp.scale.set(sc * ((sp as any).userData.aspect || 3), sc, 1); });
@@ -729,6 +1037,7 @@ export class DroneViewer {
       dist: this.sim.dist, total: this.sim.total,
       eta: this.sim.total > 0 ? (this.sim.total - this.sim.dist) / Math.max(0.1, this.scenario.speed * rate) : 0,
       battery: this.sim.batt,
+      agl: this.sim._agl,
     });
   }
 
@@ -745,11 +1054,35 @@ export class DroneViewer {
   addRthLeg() { const f = this.scenario.path[0]; if (f) { this.scenario.path.push({ lat: f.lat, lon: f.lon, alt: f.alt }); this.rebuildAll(); } }
   setSpeed(v: number) { this.scenario.speed = v; this.buildSimPath(); this.emitTelemetry(); this.cb.onScenarioChange?.(this.scenario); }
   setDefaultAlt(v: number) { this.scenario.defaultAlt = v; this.cb.onScenarioChange?.(this.scenario); }
-  setDroneScale(v: number) { this.scenario.drone.scale = v; if (this.droneMesh) this.droneMesh.scale.setScalar(v); this.cb.onScenarioChange?.(this.scenario); }
+  setDroneScale(v: number) {
+    this.scenario.drone.scale = v;
+    if (this.droneMesh) this.droneMesh.scale.setScalar(v);
+    // rescale the highlight in place (don't rebuild — that would re-download a custom GLB)
+    if (this.droneAnchor && this.highlightGroup) {
+      this.droneAnchor.remove(this.highlightGroup);
+      this.clearGroupChild(this.highlightGroup);
+      this.highlightGroup = this.buildHighlight(v); this.highlightGroup.visible = this.highlight; this.droneAnchor.add(this.highlightGroup);
+    }
+    this.cb.onScenarioChange?.(this.scenario);
+  }
+  private clearGroupChild(c: Object3D) { c.traverse((o: any) => { o.geometry?.dispose?.(); if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m: any) => m.dispose?.()); }); }
   /** Swap in a custom drone GLB (e.g. a downloaded Mavic 3 Pro). Pass null to return to the built-in model. */
   setDroneModelUrl(url: string | null) { this.droneModelUrl = url; this.scenario.drone.modelUrl = url; this.rebuildDrone(); this.cb.onScenarioChange?.(this.scenario); }
   loadDroneModelFile(file: File) { this.setDroneModelUrl(URL.createObjectURL(file)); }
   hasCustomModel() { return !!this.droneModelUrl; }
+  /** Yaw correction (deg) for imported models that fly sideways along the path. */
+  setModelYaw(deg: number) { this.scenario.drone.modelYaw = deg; this.modelYaw = deg * MathUtils.DEG2RAD; if (this.sim._pos) this.placeDroneAtDistance(this.sim.dist); this.cb.onScenarioChange?.(this.scenario); }
+  /** Toggle the drone highlight (glow halo + beacon). */
+  setHighlight(on: boolean) { this.highlight = on; this.scenario.drone.highlight = on; if (this.highlightGroup) this.highlightGroup.visible = on; this.cb.onScenarioChange?.(this.scenario); }
+  getHighlight() { return this.highlight; }
+  /** Toggle floating info annotations next to all equipment/hazards. */
+  setShowInfo(on: boolean) { this.showInfo = on; this.rebuildSituations(); this.cb.onScenarioChange?.(this.scenario); }
+  getShowInfo() { return this.showInfo; }
+  /** Toggle active terrain/building avoidance (auto-climb to hold clearance over the mesh). */
+  setAvoidTerrain(on: boolean) { this.avoidTerrain = on; if (!on) this.terrainLift = 0; }
+  getAvoidTerrain() { return this.avoidTerrain; }
+  /** Minimum clearance (m) the drone holds above the mesh when avoidance is on. */
+  setTerrainMin(m: number) { this.terrainMin = Math.max(2, m); }
   updateWaypointAlt(i: number, alt: number) { const w = this.scenario.path[i]; if (w) { w.alt = alt; w._gh = undefined; this.rebuildAll(); } }
   removeWaypoint(i: number) { this.scenario.path.splice(i, 1); this.rebuildAll(); }
   updateSituation(id: string, patch: Partial<Situation>) { const s = this.scenario.situations.find((x) => x.id === id); if (s) { Object.assign(s, patch); this.rebuildAll(); } }
@@ -758,6 +1091,39 @@ export class DroneViewer {
   removePoi(id: string) { this.scenario.pois = this.scenario.pois.filter((p) => p.id !== id); this.rebuildAll(); }
   updateArea(id: string, patch: any) { const a = this.scenario.areas.find((x) => x.id === id); if (a) { Object.assign(a, patch); this.rebuildAll(); } }
   removeArea(id: string) { this.scenario.areas = this.scenario.areas.filter((a) => a.id !== id); this.rebuildAll(); }
+  setMissionName(n: string) { this.scenario.name = n; this.cb.onScenarioChange?.(this.scenario); }
+
+  // ---------------------------------------------------------------- mapping mission (DroneDeploy-style)
+  /** Generate a serpentine "lawnmower" survey grid over the first geofence (or a default box
+   *  around the scene), the way DroneDeploy plans a mapping flight. Spacing/alt/heading in m & deg. */
+  generateSurvey(opts?: { spacing?: number; alt?: number; heading?: number }) {
+    const area = this.scenario.areas[0];
+    let c: { lat: number; lon: number }; let half: number;
+    if (area) { c = { lat: area.lat, lon: area.lon }; half = area.radius; }
+    else {
+      const ctr = this.scenarioCentroid() || this.pickGroundCenter();
+      if (!ctr) { this.toast('Search a place (or drop a geofence ⭕) first, then generate the survey'); return; }
+      c = ctr; half = 150;
+    }
+    const spacing = Math.max(8, opts?.spacing ?? 30);
+    const alt = opts?.alt ?? this.scenario.defaultAlt;
+    const hd = (opts?.heading ?? 0) * MathUtils.DEG2RAD, cos = Math.cos(hd), sin = Math.sin(hd);
+    const { mLat, mLon } = metersPerDegree(c.lat);
+    const lines = Math.max(2, Math.round((half * 2) / spacing));
+    const path: { lat: number; lon: number; alt: number }[] = [];
+    for (let i = 0; i <= lines; i++) {
+      const x = -half + i * spacing;                       // cross-track offset (m)
+      const yA = i % 2 === 0 ? -half : half, yB = i % 2 === 0 ? half : -half; // along-track sweep
+      for (const y of [yA, yB]) {
+        const e = x * cos - y * sin, n = x * sin + y * cos; // rotate grid by heading
+        path.push({ lat: c.lat + n / mLat, lon: c.lon + e / mLon, alt });
+      }
+    }
+    this.scenario.path = path.map((w) => ({ ...w, _gh: undefined }));
+    if (this.scenario.drone.lat == null) { this.scenario.drone.lat = path[0].lat; this.scenario.drone.lon = path[0].lon; }
+    this.rebuildAll(); this.reset(); this.frame();
+    this.toast(`Survey grid: ${path.length} waypoints @ ${fmtFt(alt)}, ${fmtFt(spacing)} spacing`);
+  }
 
   loadScenarioData(s: Scenario) {
     this.scenario = s;

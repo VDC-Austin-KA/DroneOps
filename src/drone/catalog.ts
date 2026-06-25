@@ -14,6 +14,10 @@ export interface HazardKind {
   color: number;
   /** Physical model height (m) for obstacle meshes. */
   h?: number;
+  /** Default working / jib swing radius (m) for cranes & similar slewing equipment. */
+  reach?: number;
+  /** Whether the operator can tune a physical height for this equipment. */
+  sizable?: boolean;
 }
 
 export type KindId =
@@ -29,12 +33,12 @@ export const KINDS: Record<KindId, HazardKind> = {
   restricted:  { cat: 'Airspace (FAA)', ic: '⛔', name: 'Restricted / TFR',    mode: 'restricted', clearR: 300, clearH: 150, color: 0xff4d4d },
   stadium:     { cat: 'Airspace (FAA)', ic: '🏟', name: 'Stadium / Crowd TFR', mode: 'restricted', clearR: 150, clearH: 120, color: 0xff7ad1 },
   // Construction
-  towercrane:  { cat: 'Construction',   ic: '🏗', name: 'Tower Crane',  mode: 'obstacle', clearR: 45, clearH: 90, color: 0xffb020, h: 80 },
-  mobilecrane: { cat: 'Construction',   ic: '🚧', name: 'Mobile Crane', mode: 'obstacle', clearR: 30, clearH: 55, color: 0xffb020, h: 48 },
-  excavator:   { cat: 'Construction',   ic: '🛠', name: 'Excavator',    mode: 'obstacle', clearR: 14, clearH: 10, color: 0xffb020, h: 6 },
+  towercrane:  { cat: 'Construction',   ic: '🏗', name: 'Tower Crane',  mode: 'obstacle', clearR: 45, clearH: 90, color: 0xffb020, h: 80, reach: 45, sizable: true },
+  mobilecrane: { cat: 'Construction',   ic: '🚧', name: 'Mobile Crane', mode: 'obstacle', clearR: 30, clearH: 55, color: 0xffb020, h: 48, reach: 30, sizable: true },
+  excavator:   { cat: 'Construction',   ic: '🛠', name: 'Excavator',    mode: 'obstacle', clearR: 14, clearH: 10, color: 0xffb020, h: 6, reach: 9, sizable: true },
   // Obstacles
-  comm:        { cat: 'Obstacles',      ic: '🗼', name: 'Comm Tower',  mode: 'obstacle', clearR: 18, clearH: 95, color: 0xff9d3a, h: 85 },
-  building:    { cat: 'Obstacles',      ic: '🏢', name: 'Building',    mode: 'obstacle', clearR: 15, clearH: 55, color: 0xffb020, h: 45 },
+  comm:        { cat: 'Obstacles',      ic: '🗼', name: 'Comm Tower',  mode: 'obstacle', clearR: 18, clearH: 95, color: 0xff9d3a, h: 85, sizable: true },
+  building:    { cat: 'Obstacles',      ic: '🏢', name: 'Building',    mode: 'obstacle', clearR: 15, clearH: 55, color: 0xffb020, h: 45, sizable: true },
   powerline:   { cat: 'Obstacles',      ic: '⚡', name: 'Power Line',  mode: 'obstacle', clearR: 12, clearH: 32, color: 0xffd24d, h: 24 },
   tree:        { cat: 'Obstacles',      ic: '🌳', name: 'Tree',        mode: 'obstacle', clearR: 8,  clearH: 18, color: 0x66cc66, h: 14 },
   // People / pad / hazards
