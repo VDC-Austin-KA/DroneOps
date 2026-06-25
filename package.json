@@ -1,0 +1,29 @@
+{
+  "name": "droneops",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Drone flight & scenario trainer on Google Photorealistic 3D Tiles — a drone-focused fork of Earth4D. Plan flight paths, drop FAA airspace & jobsite hazards with clearance volumes, fly FPV/ground/orbit cameras, and run crash + emergency training scenarios.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "typecheck": "tsc -b --noEmit"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "dependencies": {
+    "3d-tiles-renderer": "^0.4.24",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/three": "^0.169.0",
+    "@vitejs/plugin-react": "^4.3.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
